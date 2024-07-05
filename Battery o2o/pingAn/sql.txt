@@ -1,0 +1,268 @@
+--********************************************************************--
+--所属主题: 产品域
+--功能描述: sellout——金额计算
+--创建者:王兆翔
+--创建日期:2023/10/9
+--修改日期  修改人  修改内容
+--yyyymmdd  name  comment
+--********************************************************************--
+SET hive.tez.container.size = 6144;
+
+-- 自然月份维度表
+with t1 as (
+select
+   distinct cast(date_format(d, 'yyyy') as int) year,
+   cast(date_format(d, 'MM') as int) month,
+   floor(datediff(d, concat(year(d), '-01-01')) / 7) + 1 week
+from (
+  select date_add('2022-01-01', m) as d
+  from (select posexplode(split(space(datediff(current_date(), '2022-01-01')), ' ')) as (m, dummy)) d
+  ) t
+  order by year,month ,week
+)
+
+-- 地区城市表
+, t2 as (
+    select
+    case 
+        when a5.region_type=3 and a6.region_type =1 then a6.region_name
+        else a7.region_name
+        end province,       -- 省份
+    case 
+        when a6.region_type =2 then a6.region_name
+        when a5.region_type=3 and a6.region_type = 1 then a5.region_name
+        else null
+        end city,   -- 城市
+    case
+        when a5.region_type =3 then a5.region_name
+        else null 
+        end district   -- 区县
+from  (select region_id,region_name,region_type, parent_id from dwd_battery_o2o_region where region_type =3) a5 
+
+    -- 父级区域(追溯)   
+    left join (select region_id,region_name,region_type, parent_id from dwd_battery_o2o_region) a6 on a5.parent_id = a6.region_id 
+    left join (select region_id,region_name,region_type from dwd_battery_o2o_region) a7 on a6.parent_id = a7.region_id and a7.region_type = 1
+)
+    -- 网点工单
+, t3 as (
+    select
+        distinct sn.netpointid netpoint_id,
+        ckmc netpoint_name, 
+        ordernumber
+    from (select netpointid,ordernumber from (
+            select  netpointid, ordernumber,dispatchtime
+                ,row_number() over(partition by ordernumber order by dispatchtime desc) rn
+        from dwd_battery_o2o_sxonsale_netpointinstallwo) a where rn =1
+        ) sn 
+    left join (select id,ckmc from dwd_battery_o2o_cangku) c on c.id = sn.netpointid
+
+
+)       
+, t4 as (
+    -- 订单时间维度
+    select 
+         distinct year(add_time) year
+         ,month(add_time) month
+         ,floor(datediff(add_time, concat(year(add_time), '-01-01')) / 7) + 1 week  
+         ,a1.region_name province
+         ,a2.region_name city
+         ,a3.region_name district 
+         ,t3.netpoint_id
+         ,t3.netpoint_name
+         ,o.order_sn
+         ,o.order_status
+         ,o.payment
+         ,o.sd_id
+         ,o.order_id
+         ,kh.channel
+         ,g.goods_number
+        ,bat.tags_desc as first_level_return_reason
+        ,bat.tags_name as second_level_return_reason
+    from 
+        (select sd_id,fhck_id, order_id,receiver_province,receiver_city,receiver_district,from_unixtime(add_time,'yyyy-MM-dd HH:mm:ss') add_time,order_sn, order_status, payment from dwd_battery_o2o_order_info) o
+        left join (select region_id,region_name,region_type from dwd_battery_o2o_region) a1 on o.receiver_province = a1.region_id 
+        left join (select region_id,region_name,region_type from dwd_battery_o2o_region) a2 on o.receiver_city = a2.region_id 
+        left join (select region_id,region_name,region_type from dwd_battery_o2o_region) a3 on o.receiver_district = a3.region_id
+        left join t3 on o.order_sn = t3.ordernumber
+        
+         -- 客户表     
+        join (select
+                        id,
+                        case when khdm = 'TM01' then '天猫'
+                        when khdm = 'PACP001' then '平安'
+                        when khdm = 'Baisoon001' then '百顺'
+                        when khdm = 'JD01' or khdm = 'JD02' then '京东'
+                        else '' 
+                        end channel
+        
+        from dwd_battery_o2o_kehu where khdm in ('TM01','JD01','JD02','PACP001','Baisoon001')) kh on kh.id = o.sd_id
+            -- -- 订单商品表
+        left join (select distinct order_sn, goods_id, goods_name, goods_number from dwd_battery_o2o_order_goods) g on g.order_sn = o.order_sn
+
+         -- 订单标签表(一级原因)
+        left join (select order_id, tags_id from ods_oms_order_tags_df  where ds = ${bdp.system.bizdate}) tags on tags.order_id = o.order_id
+        -- 订单标签底表(二级原因)
+        left join (select id, tags_desc, tags_code,tags_name from ods_oms_base_order_tags_df  where ds = ${bdp.system.bizdate} and ((tags_code >=101 and tags_code<=117) or (tags_code>=201 and tags_code<=217))) bat on bat.id = tags.tags_id
+)
+,t5 as (
+    -- 订单数量
+    select
+        year,month,week,province,city,district,channel,netpoint_id,netpoint_name,
+        count(distinct order_sn) order_num
+    from t4
+    group by year,month,week,province,city,district,channel,netpoint_id,netpoint_name
+)
+, t6 as (
+    -- 退单时间维度
+    select
+            distinct year(info.add_time) year
+            ,month(info.add_time) month
+            ,floor(datediff(info.add_time, concat(year(info.add_time), '-01-01')) / 7) + 1 week 
+            ,a1.region_name province
+            ,a2.region_name city
+            ,a3.region_name district 
+            ,t3.netpoint_id
+            ,t3.netpoint_name
+            ,info.order_sn
+            ,info.order_id
+            ,kh.channel
+            ,re.relating_order_sn
+            ,re.return_order_sn
+            ,re.return_order_id
+            ,re.relating_order_id
+            ,re.return_total_amount
+            ,rg.goods_number_return
+            ,coalesce(bat.tags_desc,bat1.tags_desc) as first_level_return_reason
+            ,coalesce(bat.tags_name,bat1.tags_name) as second_level_return_reason
+
+    from
+        (select sd_id, return_order_id ,return_order_sn ,relating_order_id ,relating_order_sn ,return_total_amount from dwd_battery_o2o_order_return) re
+        left join  (select fhck_id,order_sn,order_id,receiver_province,receiver_city,receiver_district,from_unixtime(add_time,'yyyy-MM-dd HH:mm:ss') add_time from dwd_battery_o2o_order_info)  info on info.order_sn = re.relating_order_sn and info.order_id = re.relating_order_id
+        left join (select region_id,region_name,region_type from dwd_battery_o2o_region) a1 on info.receiver_province = a1.region_id 
+        left join (select region_id,region_name,region_type from dwd_battery_o2o_region) a2 on info.receiver_city = a2.region_id 
+        left join (select region_id,region_name,region_type from dwd_battery_o2o_region) a3 on info.receiver_district = a3.region_id
+        
+        left join t3 on t3.ordernumber = info.order_sn
+        join (select
+                        id,
+                        case when khdm = 'TM01' then '天猫'
+                        when khdm = 'PACP001' then '平安'
+                        when khdm = 'Baisoon001' then '百顺'
+                        when khdm = 'JD01' or khdm = 'JD02' then '京东'
+                        else '' 
+                        end channel
+        
+        from dwd_battery_o2o_kehu where khdm in ('TM01','JD01','JD02','PACP001','Baisoon001')) kh on kh.id = re.sd_id
+        left join (select distinct order_sn, goods_number_return from ods_oms_order_return_goods_df where ds = ${bdp.system.bizdate}) rg on re.relating_order_sn = rg.order_sn
+
+        -- retrun
+        left join (select return_order_id, tags_id, tags_name from ods_oms_order_return_tags_df  where ds = ${bdp.system.bizdate}) ort 
+                    on  re.return_order_id = ort.return_order_id 
+        -- 订单标签底表(二级原因)
+        left join (select id, tags_desc, tags_code,tags_name from ods_oms_base_order_tags_df  where ds = ${bdp.system.bizdate} and ((tags_code >=101 and tags_code<=117) or (tags_code>=201 and tags_code<=217))) bat on bat.id = ort.tags_id
+
+        -- info
+        left join (select order_id, tags_id from ods_oms_order_tags_df  where ds = ${bdp.system.bizdate}) tags on tags.order_id = info.order_id
+        -- 订单标签底表(二级原因)
+        left join (select id, tags_desc, tags_code,tags_name from ods_oms_base_order_tags_df  where ds = ${bdp.system.bizdate} and ((tags_code >=101 and tags_code<=117) or (tags_code>=201 and tags_code<=217))) bat1 on bat1.id = tags.tags_id
+)
+, t7 as (
+    -- 退单明细
+-- insert overwrite table ads_battery_o2o_return_statistic_detail_df 
+    select 
+        *
+        ,row_number() over(partition by year,month,week,province,city,district,channel,netpoint_id,netpoint_name,order_sn order by coalesce(first_level_return_reason, 0) desc,coalesce(second_level_return_reason,0) desc,goods_number desc) rn
+    from (
+    select
+        year
+        ,month
+        ,week
+        ,province
+        ,city
+        ,district
+        ,channel
+        ,netpoint_id
+        ,netpoint_name
+        ,first_level_return_reason
+        ,second_level_return_reason
+        ,order_sn
+        ,goods_number
+        ,payment 
+        ,null return_total_amount
+        ,'order_info' source
+    from t4 where t4.order_status = 3
+    union all
+    select
+        year
+        ,month
+        ,week
+        ,province
+        ,city
+        ,district
+        ,channel
+        ,netpoint_id
+        ,netpoint_name
+        ,first_level_return_reason
+        ,second_level_return_reason
+        ,relating_order_sn order_sn
+        ,goods_number_return goods_number
+        ,null payment
+        ,return_total_amount
+        ,'order_return' source
+    from t6) a
+)
+, t8 as (
+       select
+        t1.year                                     --  年                                                      
+        ,t1.month                                    --  月                 
+        ,t1.week                                     --  周                 
+        ,scn.scn_region                              --  大区                      
+        ,t2.province                                 --  省                      
+        ,t2.city                                     --  市                  
+        ,t2.district                                 --  区                      
+        ,t7.channel                                  --  渠道                  
+        ,t7.netpoint_id                              --  网点id                      
+        ,t7.netpoint_name                            --  网点名称                          
+        ,t7.first_level_return_reason                --  一级退货原因                                      
+        ,t7.second_level_return_reason               --  二级退货原因                                      
+        ,t5.order_num                                --  订单数  
+        ,t7.order_sn
+        ,t7.payment
+        ,t7.return_total_amount
+        ,t7.goods_number                    
+        from t2    
+        cross join t1
+        -- scn数据表
+        left join (select province,scn_region from ads_battery_o2o_scn_region) scn on t2.province = scn.province
+        left join (select * from t7 where rn = 1) t7 on t1.year = t7.year and t1.month = t7.month and t1.week = t7.week and t2.province = t7.province and t2.city = t7.city and t2.district = t7.district
+         left join t5 on t1.year = t5.year and t1.month = t5.month and t1.week = t5.week and t2.province = t5.province and t2.city=t5.city and t2.district =t5.district and t7.channel = t5.channel and  t7.netpoint_id = t5.netpoint_id and t7.netpoint_name = t5.netpoint_name
+         group by t1.year, t1.month, t1.week, scn.scn_region, t2.province, t2.city, t2.district, t7.channel, t7.netpoint_id, t7.netpoint_name, t7.first_level_return_reason, t7.second_level_return_reason, t5.order_num
+        ,t7.order_sn,t7.payment,t7.return_total_amount,t7.goods_number
+        )
+-- -- -- 订单信息表与退单表中所有的退单聚合    
+insert overwrite table ads_battery_o2o_return_statistic_df 
+    select
+        row_number() over() id                       -- 主键
+        ,year                                     --  年                                                      
+        ,month                                    --  月                 
+        ,week                                     --  周                 
+        ,scn_region                              --  大区                      
+        ,province                                 --  省                      
+        ,city                                     --  市                  
+        ,district                                 --  区                      
+        ,channel                                  --  渠道                  
+        ,netpoint_id                              --  网点id                      
+        ,netpoint_name                            --  网点名称                          
+        ,first_level_return_reason                --  一级退货原因                                      
+        ,second_level_return_reason               --  二级退货原因                                      
+        ,order_num                                --  订单数                  
+        ,count(distinct order_sn) return_order_num -- 退单数
+        ,sum(payment) total_amt                      -- 退单涉及的订单金额
+        ,sum(return_total_amount) return_amt         -- 退货金额
+        ,sum(goods_number) battery_num               -- 退货电瓶数量
+        ,date_format(current_timestamp(),'yyyy-MM-dd HH:mm:ss') etl_load_time   -- 数据加载时间
+        from t8
+        group by year, month, week, scn_region, province, city, district, channel, netpoint_id, netpoint_name, first_level_return_reason, second_level_return_reason, order_num
+
+-- select * from t8 where netpoint_name = '望州路安装点' and year = 2023 and month = 9 and district = '平桂管理区'
+-- select 1
